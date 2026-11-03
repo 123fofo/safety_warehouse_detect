@@ -447,6 +447,21 @@ class MaterialCounter:
         self.total_count = 0
         self.last_media_path = ""
         self.model_task = ""
+        self.model_task = ""
+
+        # ================= 【新增配置与状态字典】 =================
+        self.MIN_TRACK_FRAMES = 20  # 轨迹存活阈值：至少连续出现 20 帧才被计入总数
+        self.track_frame_counts = defaultdict(int)  # 记录每个轨迹的存活帧数
+        self.track_class_scores = {}  # 记录每个轨迹各类别的累计置信度 {tid: {cls_id: score}}
+        self.track_final_class = {}  # 记录每个轨迹最终被锁定的类别 {tid: cls_id}
+        # ==========================================================
+
+        # ================= 【新增：轨迹绘制状态】 =================
+        self.track_history = defaultdict(list)  # 格式：{track_id: [(frame_idx, cx, cy), ...]}
+        self.track_last_seen = {}  # 格式：{track_id: last_frame_idx}
+        self.MAX_HISTORY_LEN = 50  # 限制轨迹最多显示多少个历史点，防止内存爆掉或画面太乱
+        # ==========================================================
+
 
     def run(
         self,
@@ -694,7 +709,8 @@ class MaterialCounter:
             if writer is not None:
                 writer.release()
 
-    def _process_frame(self, frame: np.ndarray, frame_idx: int, detector: YOLO, class_names: dict[int, str], tracker_yaml: Path) -> tuple[np.ndarray, int]:
+    def _process_frame(self, frame: np.ndarray, frame_idx: int, detector: YOLO, class_names: dict[int, str],
+                       tracker_yaml: Path) -> tuple[np.ndarray, int]:
         with yolo_detection_logging(detector, frame_idx, self.detection_log_callback):
             results = detector.track(
                 source=frame,
@@ -714,27 +730,105 @@ class MaterialCounter:
         result = results[0] if results else None
         detections = parse_material_detections(result)
         active_tracks = 0
+
+        # ================= 【新增：清理已经“死亡”的轨迹】 =================
+        # 如果某个目标超过 track_buffer 帧没有被检测到，认为它彻底消失了，抹去它的轨迹和历史状态
+        to_remove = [
+            tid for tid, last_f in self.track_last_seen.items()
+            if frame_idx - last_f > self.tracker_args.track_buffer
+        ]
+        for tid in to_remove:
+            self.track_last_seen.pop(tid, None)
+            self.track_history.pop(tid, None)
+            self.track_frame_counts.pop(tid, None)
+            self.track_class_scores.pop(tid, None)
+            self.track_final_class.pop(tid, None)
+        # ==================================================================
+
         for detection in detections:
-            cls_id = int(detection["class_id"])
+            raw_cls_id = int(detection["class_id"])
             track_id = detection.get("track_id")
-            if cls_id not in class_names or cls_id not in self.target_class_ids or track_id is None:
+            conf = float(detection["confidence"])
+
+            if raw_cls_id not in class_names or track_id is None:
                 continue
+
             active_tracks += 1
             tid = int(track_id)
-            pair = (self.track_generation, cls_id, tid)
-            if pair not in self.counted_track_ids:
-                self.counted_track_ids.add(pair)
-                cls_name = class_names[cls_id]
-                self.class_counts[cls_name] += 1
-                self.total_count += 1
-                self.counted_track_ordinals[pair] = self.class_counts[cls_name]
+
+            # 维护最后出现的帧号
+            self.track_last_seen[tid] = frame_idx
+
+            # 1. 维护轨迹帧数与置信度累加
+            self.track_frame_counts[tid] += 1
+            if tid not in self.track_class_scores:
+                self.track_class_scores[tid] = {}
+            self.track_class_scores[tid][raw_cls_id] = self.track_class_scores[tid].get(raw_cls_id, 0.0) + conf
+
+            # 2. 计算当前累计置信度最高的类别
+            scores = self.track_class_scores[tid]
+            current_best_cls = max(scores, key=scores.get)
+
+            # 3. 判断是否达到“准入门槛” (短轨迹过滤)
+            if self.track_frame_counts[tid] >= self.MIN_TRACK_FRAMES:
+                if tid not in self.track_final_class:
+                    self.track_final_class[tid] = current_best_cls
+
+            # 获取用于显示和计数的类别
+            display_cls_id = self.track_final_class.get(tid, current_best_cls)
+
+            # 过滤掉没勾选的目标类别
+            if display_cls_id not in self.target_class_ids:
+                continue
+
+            # 4. 计数逻辑 (只有过门槛的轨迹才被计入)
+            pair = (self.track_generation, display_cls_id, tid)
+            if self.track_frame_counts[tid] >= self.MIN_TRACK_FRAMES:
+                if pair not in self.counted_track_ids:
+                    self.counted_track_ids.add(pair)
+                    cls_name = class_names[display_cls_id]
+                    self.class_counts[cls_name] += 1
+                    self.total_count += 1
+                    self.counted_track_ordinals[pair] = self.class_counts[cls_name]
+
+            # ================= 【新增：轨迹中心点更新与绘制】 =================
+            box = detection["box"]
+            cx, cy = int((box[0] + box[2]) / 2), int((box[1] + box[3]) / 2)
+            color = track_color(tid)
+
+            history = self.track_history[tid]
+
+            # 断轨检测：如果当前帧号与上一条记录相差太大（考虑到抽帧间隔），说明中间断开了
+            if history and frame_idx - history[-1][0] > self.sample_interval * 2:
+                self.track_history[tid] = history = []  # 清空旧轨迹，重新开始画
+
+            history.append((frame_idx, cx, cy))
+            if len(history) > self.MAX_HISTORY_LEN:
+                history.pop(0)  # 限制轨迹长度
+
+            # 绘制轨迹连线
+            if len(history) > 1:
+                for i in range(1, len(history)):
+                    f1, px1, py1 = history[i - 1]
+                    f2, px2, py2 = history[i]
+                    # 确保两点之间是连续的（给抽帧留一点容错）
+                    if f2 - f1 <= self.sample_interval * 2:
+                        cv2.line(frame, (px1, py1), (px2, py2), color, thickness=2, lineType=cv2.LINE_AA)
+            # ==================================================================
+
+            # 5. 画框逻辑
             ordinal = self.counted_track_ordinals.get(pair, 0)
+            label = f"{class_names[display_cls_id]}"
+            if ordinal > 0:
+                label += f" {ordinal}"
+
             draw_labeled_detection(
                 frame,
                 detection["points"],
-                f"{class_names[cls_id]} {ordinal}",
-                track_color(tid),
+                label,
+                color,  # 直接复用刚才计算的 color
             )
+
         if frame_idx % 30 == 0:
             print(f"[material-count] frame={frame_idx} tracks={active_tracks} count={self.total_count}", flush=True)
         return frame, active_tracks
